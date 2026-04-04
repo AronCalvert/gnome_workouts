@@ -20,6 +20,7 @@ class ExercisePlan:
     order_index: int
     rest_seconds: int
     timed_seconds: int | None
+    superset_group: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

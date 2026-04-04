@@ -87,6 +87,16 @@ class Database:
             """
         )
         self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        try:
+            self._conn.execute(
+                "ALTER TABLE exercises ADD COLUMN superset_group INTEGER DEFAULT NULL"
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     # row mappers
 
@@ -100,6 +110,9 @@ class Database:
             rest_seconds=int(r["rest_seconds"]),
             timed_seconds=int(r["timed_seconds"])
             if r["timed_seconds"] is not None
+            else None,
+            superset_group=int(r["superset_group"])
+            if r["superset_group"] is not None
             else None,
         )
 
@@ -135,7 +148,7 @@ class Database:
         exercises = [
             self._row_to_exercise(r)
             for r in self._conn.execute(
-                "SELECT id, name, exercise_type, order_index, rest_seconds, timed_seconds"
+                "SELECT id, name, exercise_type, order_index, rest_seconds, timed_seconds, superset_group"
                 " FROM exercises WHERE workout_id = ? ORDER BY order_index ASC",
                 (workout_id,),
             ).fetchall()
@@ -161,7 +174,7 @@ class Database:
         self, exercise_id: int
     ) -> tuple[ExercisePlan, list[SetPlan]] | None:
         row = self._conn.execute(
-            "SELECT id, workout_id, name, exercise_type, order_index, rest_seconds, timed_seconds"
+            "SELECT id, workout_id, name, exercise_type, order_index, rest_seconds, timed_seconds, superset_group"
             " FROM exercises WHERE id = ?",
             (exercise_id,),
         ).fetchone()
@@ -358,6 +371,21 @@ class Database:
             raise ValueError("Exercise not found in this workout")
         with self._conn:
             self._conn.execute("DELETE FROM exercises WHERE id = ?", (exercise_id,))
+            # Unlink any exercises whose superset group now has only one member
+            self._conn.execute(
+                """
+                UPDATE exercises SET superset_group = NULL
+                WHERE workout_id = ?
+                  AND superset_group IS NOT NULL
+                  AND superset_group IN (
+                    SELECT superset_group FROM exercises
+                    WHERE workout_id = ?
+                    GROUP BY superset_group
+                    HAVING COUNT(*) < 2
+                  )
+                """,
+                (workout_id, workout_id),
+            )
             for i, r in enumerate(
                 self._conn.execute(
                     "SELECT id FROM exercises WHERE workout_id = ? ORDER BY order_index ASC",
@@ -368,6 +396,59 @@ class Database:
                     "UPDATE exercises SET order_index = ? WHERE id = ?",
                     (i, int(r["id"])),
                 )
+
+    def set_exercises_as_superset(
+        self, workout_id: int, exercise_id_a: int, exercise_id_b: int
+    ) -> None:
+        """Link two exercises as a superset pair."""
+        row_a = self._conn.execute(
+            "SELECT superset_group FROM exercises WHERE id = ? AND workout_id = ?",
+            (exercise_id_a, workout_id),
+        ).fetchone()
+        row_b = self._conn.execute(
+            "SELECT superset_group FROM exercises WHERE id = ? AND workout_id = ?",
+            (exercise_id_b, workout_id),
+        ).fetchone()
+        if row_a is None or row_b is None:
+            raise ValueError("Exercise not found in this workout")
+        existing_group = (
+            row_a["superset_group"]
+            if row_a["superset_group"] is not None
+            else row_b["superset_group"]
+        )
+        if existing_group is None:
+            max_group = self._conn.execute(
+                "SELECT COALESCE(MAX(superset_group), 0) AS m FROM exercises WHERE workout_id = ?",
+                (workout_id,),
+            ).fetchone()["m"]
+            existing_group = int(max_group) + 1
+        with self._conn:
+            self._conn.execute(
+                "UPDATE exercises SET superset_group = ? WHERE id IN (?, ?) AND workout_id = ?",
+                (existing_group, exercise_id_a, exercise_id_b, workout_id),
+            )
+
+    def unlink_exercise_from_superset(self, workout_id: int, exercise_id: int) -> None:
+        """Remove an exercise from its superset group, also unlinking any lone partner."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE exercises SET superset_group = NULL WHERE id = ? AND workout_id = ?",
+                (exercise_id, workout_id),
+            )
+            self._conn.execute(
+                """
+                UPDATE exercises SET superset_group = NULL
+                WHERE workout_id = ?
+                  AND superset_group IS NOT NULL
+                  AND superset_group IN (
+                    SELECT superset_group FROM exercises
+                    WHERE workout_id = ?
+                    GROUP BY superset_group
+                    HAVING COUNT(*) < 2
+                  )
+                """,
+                (workout_id, workout_id),
+            )
 
     def start_session(self, workout_id: int) -> int:
         with self._conn:

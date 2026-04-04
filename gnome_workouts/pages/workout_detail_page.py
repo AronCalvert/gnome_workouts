@@ -162,9 +162,7 @@ class WorkoutDetailPage(Adw.NavigationPage):
             row.add_suffix(del_btn)
 
             if ex.exercise_type == "timed" and ex.timed_seconds is not None:
-                row.set_subtitle(
-                    f"{len(sets)} set(s) \u2022 {ex.timed_seconds}s hold \u2022 rest {ex.rest_seconds}s"
-                )
+                parts = [f"{len(sets)} set(s)", f"{ex.timed_seconds}s hold", f"rest {ex.rest_seconds}s"]
             else:
                 first = sets[0] if sets else None
                 parts = [f"{len(sets)} set(s)"]
@@ -179,7 +177,14 @@ class WorkoutDetailPage(Adw.NavigationPage):
                         f"{prefs.kg_to_display(first.target_weight_kg):g} {prefs.weight_label}"
                     )
                 parts.append(f"rest {ex.rest_seconds}s")
-                row.set_subtitle(" \u2022 ".join(parts))
+            if ex.superset_group is not None:
+                partner = next(
+                    (e for e in plan.exercises if e.id != ex.id and e.superset_group == ex.superset_group),
+                    None,
+                )
+                if partner is not None:
+                    parts.append(f"superset with {partner.name}")
+            row.set_subtitle(" \u2022 ".join(parts))
 
             row.set_subtitle_lines(2)
             list_box.append(row)
@@ -356,6 +361,32 @@ class WorkoutDetailPage(Adw.NavigationPage):
             else 45,
         )
 
+        # Build superset partner dropdown
+        other_exercises = [ex for ex in self._plan.exercises if ex.id != exercise_id]
+        partner_ids: list[int | None] = [None]
+        superset_model = Gtk.StringList()
+        superset_model.append("None")
+        current_group = exercise.superset_group
+        current_partner_idx = 0
+        for i, other in enumerate(other_exercises):
+            superset_model.append(other.name)
+            partner_ids.append(other.id)
+            if current_group is not None and other.superset_group == current_group:
+                current_partner_idx = i + 1
+
+        superset_dd: Gtk.DropDown | None = None
+        if other_exercises:
+            superset_dd = Gtk.DropDown(model=superset_model)
+            superset_dd.set_selected(current_partner_idx)
+            superset_dd.set_hexpand(True)
+            superset_dd.set_valign(Gtk.Align.CENTER)
+            set_accessible_label(superset_dd, "Superset partner exercise")
+            ss_row = Adw.ActionRow(title="Superset With")
+            ss_row.set_subtitle("Run back-to-back with no rest in between")
+            ss_row.set_subtitle_lines(2)
+            ss_row.add_suffix(superset_dd)
+            f.form.append(ss_row)
+
         dialog = Adw.AlertDialog()
         dialog.set_heading("Edit Exercise")
         dialog.set_extra_child(f.form)
@@ -395,6 +426,33 @@ class WorkoutDetailPage(Adw.NavigationPage):
             except ValueError as exc:
                 self._show_error(str(exc))
                 return
+
+            # Handle superset pairing changes
+            if superset_dd is not None:
+                new_idx = superset_dd.get_selected()
+                new_partner_id = partner_ids[new_idx] if new_idx < len(partner_ids) else None
+                old_partner_id = (
+                    partner_ids[current_partner_idx]
+                    if current_partner_idx < len(partner_ids)
+                    else None
+                )
+                if new_partner_id != old_partner_id:
+                    if current_group is not None:
+                        self._db.unlink_exercise_from_superset(self._workout_id, exercise_id)
+                    if new_partner_id is not None:
+                        # Unlink new partner from any existing superset first
+                        new_partner_ex = next(
+                            (ex for ex in self._plan.exercises if ex.id == new_partner_id),
+                            None,
+                        )
+                        if new_partner_ex and new_partner_ex.superset_group is not None:
+                            self._db.unlink_exercise_from_superset(
+                                self._workout_id, new_partner_id
+                            )
+                        self._db.set_exercises_as_superset(
+                            self._workout_id, exercise_id, new_partner_id
+                        )
+
             self._reload()
 
         dialog.connect("response", on_response)

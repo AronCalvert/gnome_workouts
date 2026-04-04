@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import gi
 
 gi.require_version("Adw", "1")
@@ -26,6 +28,78 @@ def _format_set_detail(line: SessionPerformedLine) -> str:
     return ", ".join(parts) if parts else "\u2014"
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkoutStep:
+    exercise: ExercisePlan
+    set_plan: SetPlan
+    rest_after: int        # seconds; 0 = go directly to next step (superset partner)
+    group_index: int       # 0-indexed position of this group in the workout
+    total_groups: int      # total number of non-empty groups
+    round_number: int      # 1-indexed round/set number within this group
+    total_rounds: int      # total rounds for this group
+    in_superset: bool      # True when part of a superset
+    superset_pos: int      # 1-indexed position within superset (1 for solo)
+    superset_size: int     # total exercises in superset (1 for solo)
+
+
+def _build_steps(plan: WorkoutPlan) -> list[_WorkoutStep]:
+    """Build a flat ordered list of workout steps, with superset interleaving."""
+    # Build ordered groups (solo exercises or superset clusters)
+    ordered_groups: list[list[ExercisePlan]] = []
+    seen_groups: set[int] = set()
+    for ex in plan.exercises:
+        if ex.superset_group is None:
+            ordered_groups.append([ex])
+        elif ex.superset_group not in seen_groups:
+            seen_groups.add(ex.superset_group)
+            cluster = [e for e in plan.exercises if e.superset_group == ex.superset_group]
+            ordered_groups.append(cluster)
+
+    # Keep only groups that have at least one set
+    non_empty = [
+        g for g in ordered_groups
+        if max((len(plan.sets_by_exercise_id.get(ex.id, [])) for ex in g), default=0) > 0
+    ]
+
+    total_groups = len(non_empty)
+    steps: list[_WorkoutStep] = []
+
+    for group_idx, group in enumerate(non_empty):
+        is_superset = len(group) > 1
+        all_sets = [plan.sets_by_exercise_id.get(ex.id, []) for ex in group]
+        max_rounds = max(len(s) for s in all_sets)
+        # Rest comes from the last exercise in the group
+        group_rest = group[-1].rest_seconds
+
+        for round_idx in range(max_rounds):
+            # Collect the exercises that have a set for this round
+            round_entries: list[tuple[ExercisePlan, SetPlan, int]] = []
+            for ex_pos, ex in enumerate(group):
+                ex_sets = plan.sets_by_exercise_id.get(ex.id, [])
+                if round_idx < len(ex_sets):
+                    round_entries.append((ex, ex_sets[round_idx], ex_pos))
+
+            for i, (ex, s, ex_pos) in enumerate(round_entries):
+                is_last_in_round = (i == len(round_entries) - 1)
+                rest = group_rest if is_last_in_round else 0
+                steps.append(
+                    _WorkoutStep(
+                        exercise=ex,
+                        set_plan=s,
+                        rest_after=rest,
+                        group_index=group_idx,
+                        total_groups=total_groups,
+                        round_number=round_idx + 1,
+                        total_rounds=max_rounds,
+                        in_superset=is_superset,
+                        superset_pos=ex_pos + 1,
+                        superset_size=len(group),
+                    )
+                )
+
+    return steps
+
+
 class WorkoutRunPage(Adw.NavigationPage):
     """
     Active workout session page.
@@ -50,8 +124,8 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._session_id = session_id
         self._prefs = prefs
 
-        self._exercise_index = 0
-        self._set_index = 0
+        self._steps = _build_steps(plan)
+        self._step_index = 0
         self._reps_row: Adw.SpinRow | None = None
         self._weight_row: Adw.SpinRow | None = None
 
@@ -94,6 +168,13 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._headline.set_wrap(True)
         self._headline.set_justify(Gtk.Justification.CENTER)
         name_block.append(self._headline)
+
+        self._superset_label = Gtk.Label()
+        self._superset_label.add_css_class("caption")
+        self._superset_label.add_css_class("accent")
+        self._superset_label.set_halign(Gtk.Align.CENTER)
+        self._superset_label.set_visible(False)
+        name_block.append(self._superset_label)
 
         self._progress_label = Gtk.Label()
         self._progress_label.add_css_class("dim-label")
@@ -199,25 +280,6 @@ class WorkoutRunPage(Adw.NavigationPage):
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _current_exercise(self) -> ExercisePlan | None:
-        if self._exercise_index < 0 or self._exercise_index >= len(self._plan.exercises):
-            return None
-        return self._plan.exercises[self._exercise_index]
-
-    def _current_set(self, ex: ExercisePlan) -> SetPlan | None:
-        sets = self._plan.sets_by_exercise_id.get(ex.id, [])
-        if self._set_index < 0 or self._set_index >= len(sets):
-            return None
-        return sets[self._set_index]
-
-    def _advance(self, ex: ExercisePlan) -> None:
-        """Increment set/exercise indices."""
-        sets = self._plan.sets_by_exercise_id.get(ex.id, [])
-        self._set_index += 1
-        if self._set_index >= len(sets):
-            self._exercise_index += 1
-            self._set_index = 0
-
     def _show_section(self, section: Gtk.Widget) -> None:
         for s in (self._active_section, self._rest_section, self._complete_section):
             s.set_visible(s is section)
@@ -225,58 +287,66 @@ class WorkoutRunPage(Adw.NavigationPage):
     # ── Render ───────────────────────────────────────────────────────────────
 
     def _render_current(self) -> None:
-        """Populate and display the active-set state; skips empty exercises."""
-        while True:
-            clear_container(self._set_list)
-            self._reps_row = None
-            self._weight_row = None
+        clear_container(self._set_list)
+        self._reps_row = None
+        self._weight_row = None
 
-            ex = self._current_exercise()
-            if ex is None:
-                self._end_session()
-                return
+        if self._step_index >= len(self._steps):
+            self._end_session()
+            return
 
-            sets = self._plan.sets_by_exercise_id.get(ex.id, [])
-            cur_set = self._current_set(ex)
-            if not sets or cur_set is None:
-                self._exercise_index += 1
-                self._set_index = 0
-                continue
+        step = self._steps[self._step_index]
+        ex = step.exercise
+        cur_set = step.set_plan
 
-            total_ex = len(self._plan.exercises)
-            total_sets = len(sets)
-            self._headline.set_label(ex.name)
+        self._headline.set_label(ex.name)
+
+        if step.in_superset:
+            self._superset_label.set_label(
+                f"Superset \u00b7 {step.superset_pos} of {step.superset_size}"
+            )
+            self._superset_label.set_visible(True)
             self._progress_label.set_label(
-                f"Set {self._set_index + 1} of {total_sets}"
+                f"Round {step.round_number} of {step.total_rounds}"
                 f"\u2002\u00b7\u2002"
-                f"Exercise {self._exercise_index + 1} of {total_ex}"
+                f"Group {step.group_index + 1} of {step.total_groups}"
+            )
+        else:
+            self._superset_label.set_visible(False)
+            self._progress_label.set_label(
+                f"Set {step.round_number} of {step.total_rounds}"
+                f"\u2002\u00b7\u2002"
+                f"Exercise {step.group_index + 1} of {step.total_groups}"
             )
 
-            if ex.exercise_type == "timed":
-                seconds = ex.timed_seconds or 0
-                row = Adw.ActionRow(title="Hold Duration")
-                row.set_subtitle(f"{seconds} seconds")
-                self._set_list.append(row)
-            else:
-                reps_adj = Gtk.Adjustment(value=float(cur_set.target_reps or 0), lower=0, upper=999, step_increment=1)
-                reps = Adw.SpinRow(title="Reps completed", adjustment=reps_adj, digits=0)
+        if ex.exercise_type == "timed":
+            seconds = ex.timed_seconds or 0
+            row = Adw.ActionRow(title="Hold Duration")
+            row.set_subtitle(f"{seconds} seconds")
+            self._set_list.append(row)
+        else:
+            reps_adj = Gtk.Adjustment(
+                value=float(cur_set.target_reps or 0), lower=0, upper=999, step_increment=1
+            )
+            reps = Adw.SpinRow(title="Reps completed", adjustment=reps_adj, digits=0)
 
-                weight_adj = Gtk.Adjustment(
-                    value=self._prefs.kg_to_display(float(cur_set.target_weight_kg or 0.0)),
-                    lower=0.0,
-                    upper=self._prefs.weight_max,
-                    step_increment=self._prefs.weight_step,
-                )
-                weight = Adw.SpinRow(title=f"Weight ({self._prefs.weight_label})", adjustment=weight_adj, digits=1)
-                weight.set_subtitle("Use 0 for bodyweight")
-                weight.set_subtitle_lines(2)
-                self._reps_row = reps
-                self._weight_row = weight
-                self._set_list.append(reps)
-                self._set_list.append(weight)
+            weight_adj = Gtk.Adjustment(
+                value=self._prefs.kg_to_display(float(cur_set.target_weight_kg or 0.0)),
+                lower=0.0,
+                upper=self._prefs.weight_max,
+                step_increment=self._prefs.weight_step,
+            )
+            weight = Adw.SpinRow(
+                title=f"Weight ({self._prefs.weight_label})", adjustment=weight_adj, digits=1
+            )
+            weight.set_subtitle("Use 0 for bodyweight")
+            weight.set_subtitle_lines(2)
+            self._reps_row = reps
+            self._weight_row = weight
+            self._set_list.append(reps)
+            self._set_list.append(weight)
 
-            self._show_section(self._active_section)
-            return
+        self._show_section(self._active_section)
 
     def _start_rest(self, seconds: int, next_name: str) -> None:
         self._rest_next_label.set_label(f"Next up: {next_name}")
@@ -330,12 +400,11 @@ class WorkoutRunPage(Adw.NavigationPage):
     # ── Signal handlers ──────────────────────────────────────────────────────
 
     def _on_complete_clicked(self, _btn: Gtk.Button) -> None:
-        ex = self._current_exercise()
-        if ex is None:
+        if self._step_index >= len(self._steps):
             return
-        cur_set = self._current_set(ex)
-        if cur_set is None:
-            return
+        step = self._steps[self._step_index]
+        ex = step.exercise
+        cur_set = step.set_plan
 
         reps: int | None = None
         weight: float | None = None
@@ -361,22 +430,21 @@ class WorkoutRunPage(Adw.NavigationPage):
             duration_seconds=duration,
         )
 
-        rest_seconds = ex.rest_seconds
-        self._advance(ex)
+        rest = step.rest_after
+        self._step_index += 1
 
-        next_ex = self._current_exercise()
-        if next_ex is None:
+        if self._step_index >= len(self._steps):
             self._end_session()
-        elif rest_seconds > 0:
-            self._start_rest(rest_seconds, next_ex.name)
+        elif rest > 0:
+            next_step = self._steps[self._step_index]
+            self._start_rest(rest, next_step.exercise.name)
         else:
             self._render_current()
 
     def _on_skip_set_clicked(self, _btn: Gtk.Button) -> None:
-        ex = self._current_exercise()
-        if ex is None or self._current_set(ex) is None:
+        if self._step_index >= len(self._steps):
             return
-        self._advance(ex)
+        self._step_index += 1
         self._render_current()
 
     def _on_rest_finished(self, _timer: CountdownTimer) -> None:
