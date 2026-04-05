@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import gi
 
@@ -9,6 +9,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Adw, GObject, Gtk
 
+from ..models import SetPlan
 from ..ui_utils import *
 
 
@@ -19,9 +20,8 @@ class _ExerciseForm:
     type_dd: Gtk.DropDown
     rest_adj: Gtk.Adjustment
     sets_adj: Gtk.Adjustment
-    reps_adj: Gtk.Adjustment
-    weight_adj: Gtk.Adjustment
     dur_adj: Gtk.Adjustment
+    set_adjs: list[tuple[Gtk.Adjustment, Gtk.Adjustment]] = field(default_factory=list)
 
 
 class WorkoutDetailPage(Adw.NavigationPage):
@@ -168,18 +168,27 @@ class WorkoutDetailPage(Adw.NavigationPage):
                     f"rest {ex.rest_seconds}s",
                 ]
             else:
-                first = sets[0] if sets else None
                 parts = [f"{len(sets)} set(s)"]
-                if first and first.target_reps is not None:
-                    parts.append(f"{first.target_reps} reps")
-                if (
-                    first
-                    and first.target_weight_kg is not None
-                    and first.target_weight_kg > 0
-                ):
-                    parts.append(
-                        f"{prefs.kg_to_display(first.target_weight_kg):g} {prefs.weight_label}"
-                    )
+                reps_vals = [s.target_reps for s in sets if s.target_reps is not None]
+                kg_vals = [
+                    s.target_weight_kg
+                    for s in sets
+                    if s.target_weight_kg is not None and s.target_weight_kg > 0
+                ]
+                if reps_vals:
+                    if len(set(reps_vals)) == 1:
+                        parts.append(f"{reps_vals[0]} reps")
+                    else:
+                        parts.append(f"{min(reps_vals)}\u2013{max(reps_vals)} reps")
+                if kg_vals:
+                    if len(set(kg_vals)) == 1:
+                        parts.append(
+                            f"{prefs.kg_to_display(kg_vals[0]):g} {prefs.weight_label}"
+                        )
+                    else:
+                        lo = prefs.kg_to_display(min(kg_vals))
+                        hi = prefs.kg_to_display(max(kg_vals))
+                        parts.append(f"{lo:g}\u2013{hi:g} {prefs.weight_label}")
                 parts.append(f"rest {ex.rest_seconds}s")
             if ex.superset_group is not None:
                 partner = next(
@@ -216,12 +225,23 @@ class WorkoutDetailPage(Adw.NavigationPage):
         name: str = "",
         exercise_type: str = "reps",
         rest_seconds: int = 90,
-        num_sets: int = 3,
-        target_reps: int = 10,
-        target_weight_display: float = 0.0,
+        initial_sets: list[SetPlan] | None = None,
         timed_seconds: int = 45,
     ) -> _ExerciseForm:
         prefs = self._app.prefs
+
+        if initial_sets:
+            init: list[tuple[int, float]] = [
+                (
+                    s.target_reps if s.target_reps is not None else 10,
+                    prefs.kg_to_display(s.target_weight_kg)
+                    if s.target_weight_kg is not None
+                    else 0.0,
+                )
+                for s in initial_sets
+            ]
+        else:
+            init = [(10, 0.0), (10, 0.0), (10, 0.0)]
 
         name_row = Adw.EntryRow(title="Name")
         name_row.set_text(name)
@@ -244,27 +264,8 @@ class WorkoutDetailPage(Adw.NavigationPage):
             title="Rest Between Sets (seconds)", adjustment=rest_adj, digits=0
         )
 
-        sets_adj = Gtk.Adjustment(value=num_sets, lower=1, upper=20, step_increment=1)
+        sets_adj = Gtk.Adjustment(value=len(init), lower=1, upper=20, step_increment=1)
         sets_row = Adw.SpinRow(title="Number of Sets", adjustment=sets_adj, digits=0)
-
-        reps_adj = Gtk.Adjustment(
-            value=target_reps, lower=0, upper=999, step_increment=1
-        )
-        reps_row = Adw.SpinRow(
-            title="Target Reps per Set", adjustment=reps_adj, digits=0
-        )
-
-        weight_adj = Gtk.Adjustment(
-            value=target_weight_display,
-            lower=0,
-            upper=prefs.weight_max,
-            step_increment=prefs.weight_step,
-        )
-        weight_row = Adw.SpinRow(
-            title=f"Target Weight ({prefs.weight_label})",
-            adjustment=weight_adj,
-            digits=1,
-        )
 
         dur_adj = Gtk.Adjustment(
             value=timed_seconds, lower=1, upper=600, step_increment=1
@@ -273,26 +274,134 @@ class WorkoutDetailPage(Adw.NavigationPage):
             title="Hold Duration (seconds)", adjustment=dur_adj, digits=0
         )
 
+        set_adjs: list[tuple[Gtk.Adjustment, Gtk.Adjustment]] = []
+        sets_rows_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+
+        _sync_sids: list[tuple[Gtk.Adjustment, int]] = []
+
+        def _propagate_first(*_args: object) -> None:
+            if not set_adjs:
+                return
+            r0, w0 = set_adjs[0]
+            for r_adj, w_adj in set_adjs[1:]:
+                r_adj.set_value(r0.get_value())
+                w_adj.set_value(w0.get_value())
+
+        def _set_rows_sensitive(sensitive: bool) -> None:
+            child = sets_rows_box.get_first_child()
+            idx = 0
+            while child is not None:
+                if idx > 0:
+                    child.set_sensitive(sensitive)
+                idx += 1
+                child = child.get_next_sibling()
+
+        def _on_sync_toggled(*_args: object) -> None:
+            if sync_row.get_active():
+                _propagate_first()
+                if set_adjs:
+                    r0, w0 = set_adjs[0]
+                    _sync_sids.append(
+                        (r0, r0.connect("value-changed", _propagate_first))
+                    )
+                    _sync_sids.append(
+                        (w0, w0.connect("value-changed", _propagate_first))
+                    )
+                _set_rows_sensitive(False)
+            else:
+                for adj, sid in _sync_sids:
+                    adj.disconnect(sid)
+                _sync_sids.clear()
+                _set_rows_sensitive(True)
+
+        all_same = len(init) <= 1 or all(
+            r == init[0][0] and w == init[0][1] for r, w in init[1:]
+        )
+        sync_row = Adw.SwitchRow(title="Same for All Sets")
+        sync_row.set_active(all_same)
+        sync_row.connect("notify::active", _on_sync_toggled)
+
+        def _add_set_row(reps: int = 10, weight: float = 0.0) -> None:
+            n = len(set_adjs) + 1
+            r_adj = Gtk.Adjustment(value=reps, lower=0, upper=999, step_increment=1)
+            w_adj = Gtk.Adjustment(
+                value=weight,
+                lower=0.0,
+                upper=prefs.weight_max,
+                step_increment=prefs.weight_step,
+            )
+            set_adjs.append((r_adj, w_adj))
+
+            row = Adw.ActionRow(title=f"Set {n}")
+            if n > 1 and sync_row.get_active():
+                row.set_sensitive(False)
+
+            r_spin = Gtk.SpinButton(adjustment=r_adj, digits=0)
+            r_spin.set_valign(Gtk.Align.CENTER)
+            r_spin.set_max_width_chars(4)
+            r_label = Gtk.Label(label=" reps")
+            r_label.add_css_class("dim-label")
+            r_label.set_valign(Gtk.Align.CENTER)
+
+            w_spin = Gtk.SpinButton(adjustment=w_adj, digits=1)
+            w_spin.set_valign(Gtk.Align.CENTER)
+            w_spin.set_max_width_chars(5)
+            w_label = Gtk.Label(label=f" {prefs.weight_label}")
+            w_label.add_css_class("dim-label")
+            w_label.set_valign(Gtk.Align.CENTER)
+
+            suffix_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            suffix_box.set_valign(Gtk.Align.CENTER)
+            for w in (r_spin, r_label, w_spin, w_label):
+                suffix_box.append(w)
+            row.add_suffix(suffix_box)
+            sets_rows_box.append(row)
+
+        def _remove_last_set_row() -> None:
+            if set_adjs:
+                set_adjs.pop()
+                child = sets_rows_box.get_last_child()
+                if child is not None:
+                    sets_rows_box.remove(child)
+
+        for reps, weight in init:
+            _add_set_row(reps, weight)
+
+        _on_sync_toggled()
+
+        def _on_sets_count_changed(*_args: object) -> None:
+            target = int(sets_adj.get_value())
+            while len(set_adjs) < target:
+                last_r, last_w = set_adjs[-1] if set_adjs else (None, None)
+                _add_set_row(
+                    int(last_r.get_value()) if last_r else 10,
+                    float(last_w.get_value()) if last_w else 0.0,
+                )
+            while len(set_adjs) > target:
+                _remove_last_set_row()
+
+        sets_adj.connect("value-changed", _on_sets_count_changed)
+
         form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         for widget in (
             name_row,
             type_row,
             rest_row,
             sets_row,
-            reps_row,
-            weight_row,
+            sync_row,
+            sets_rows_box,
             timed_row,
         ):
             form.append(widget)
 
-        def sync_type(*_args: object) -> None:
+        def _sync_type(*_args: object) -> None:
             is_reps = type_dd.get_selected() == 0
-            reps_row.set_visible(is_reps)
-            weight_row.set_visible(is_reps)
+            sync_row.set_visible(is_reps)
+            sets_rows_box.set_visible(is_reps)
             timed_row.set_visible(not is_reps)
 
-        type_dd.connect("notify::selected", sync_type)
-        sync_type()
+        type_dd.connect("notify::selected", _sync_type)
+        _sync_type()
 
         return _ExerciseForm(
             form=form,
@@ -300,9 +409,8 @@ class WorkoutDetailPage(Adw.NavigationPage):
             type_dd=type_dd,
             rest_adj=rest_adj,
             sets_adj=sets_adj,
-            reps_adj=reps_adj,
-            weight_adj=weight_adj,
             dur_adj=dur_adj,
+            set_adjs=set_adjs,
         )
 
     # handling
@@ -349,21 +457,12 @@ class WorkoutDetailPage(Adw.NavigationPage):
             return
         exercise, sets = details
         prefs = self._app.prefs
-        stored_kg = (
-            sets[0].target_weight_kg
-            if sets and sets[0].target_weight_kg is not None
-            else 0.0
-        )
 
         f = self._build_exercise_form(
             name=exercise.name,
             exercise_type=exercise.exercise_type,
             rest_seconds=exercise.rest_seconds,
-            num_sets=len(sets),
-            target_reps=sets[0].target_reps
-            if sets and sets[0].target_reps is not None
-            else 10,
-            target_weight_display=prefs.kg_to_display(stored_kg),
+            initial_sets=sets,
             timed_seconds=exercise.timed_seconds
             if exercise.timed_seconds is not None
             else 45,
@@ -414,7 +513,18 @@ class WorkoutDetailPage(Adw.NavigationPage):
             if response != "save":
                 return
             typ = "reps" if f.type_dd.get_selected() == 0 else "timed"
-            w_raw = float(f.weight_adj.get_value()) if typ == "reps" else None
+            if typ == "reps":
+                set_configs: list[tuple[int | None, float | None]] = [
+                    (
+                        int(r_adj.get_value()),
+                        prefs.display_to_kg(float(w_adj.get_value()))
+                        if float(w_adj.get_value()) > 0
+                        else None,
+                    )
+                    for r_adj, w_adj in f.set_adjs
+                ]
+            else:
+                set_configs = [(None, None)] * int(f.sets_adj.get_value())
             try:
                 self._db.update_exercise(
                     exercise_id,
@@ -424,11 +534,7 @@ class WorkoutDetailPage(Adw.NavigationPage):
                     timed_seconds=int(f.dur_adj.get_value())
                     if typ == "timed"
                     else None,
-                    num_sets=int(f.sets_adj.get_value()),
-                    target_reps=int(f.reps_adj.get_value()) if typ == "reps" else None,
-                    target_weight_kg=None
-                    if (w_raw is None or w_raw <= 0.0)
-                    else prefs.display_to_kg(w_raw),
+                    set_configs=set_configs,
                 )
             except ValueError as exc:
                 self._show_error(str(exc))
@@ -495,7 +601,18 @@ class WorkoutDetailPage(Adw.NavigationPage):
             if response != "add":
                 return
             typ = "reps" if f.type_dd.get_selected() == 0 else "timed"
-            w_raw = float(f.weight_adj.get_value()) if typ == "reps" else None
+            if typ == "reps":
+                set_configs: list[tuple[int | None, float | None]] = [
+                    (
+                        int(r_adj.get_value()),
+                        prefs.display_to_kg(float(w_adj.get_value()))
+                        if float(w_adj.get_value()) > 0
+                        else None,
+                    )
+                    for r_adj, w_adj in f.set_adjs
+                ]
+            else:
+                set_configs = [(None, None)] * int(f.sets_adj.get_value())
             try:
                 self._db.add_exercise_to_workout(
                     self._workout_id,
@@ -505,11 +622,7 @@ class WorkoutDetailPage(Adw.NavigationPage):
                     timed_seconds=int(f.dur_adj.get_value())
                     if typ == "timed"
                     else None,
-                    num_sets=int(f.sets_adj.get_value()),
-                    target_reps=int(f.reps_adj.get_value()) if typ == "reps" else None,
-                    target_weight_kg=None
-                    if (w_raw is None or w_raw <= 0.0)
-                    else prefs.display_to_kg(w_raw),
+                    set_configs=set_configs,
                 )
             except ValueError as exc:
                 self._show_error(str(exc))

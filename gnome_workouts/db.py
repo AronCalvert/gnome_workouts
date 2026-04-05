@@ -226,34 +226,92 @@ class Database:
     def _validate_exercise(
         name: str,
         exercise_type: str,
-        num_sets: int,
-        target_reps: int | None,
-        target_weight_kg: float | None,
+        set_configs: list[tuple[int | None, float | None]],
         timed_seconds: int | None,
-    ) -> tuple[str, int | None, float | None, int | None]:
-        """Validate and normalise exercise fields. Returns (name, tr, tw, ts)."""
+    ) -> tuple[str, list[tuple[int | None, float | None]], int | None]:
+        """Validate and normalise exercise fields. Returns (name, validated_set_configs, ts)."""
         name = name.strip()
         if not name:
             raise ValueError("Exercise name is required")
         if exercise_type not in ("reps", "timed"):
             raise ValueError("exercise_type must be 'reps' or 'timed'")
-        if num_sets < 1 or num_sets > 50:
+        if not (1 <= len(set_configs) <= 50):
             raise ValueError("Number of sets must be between 1 and 50")
         if exercise_type == "reps":
-            tr = int(target_reps) if target_reps is not None else 10
-            if tr < 0 or tr > 999:
-                raise ValueError("Target reps must be between 0 and 999")
-            tw = target_weight_kg
-            if tw is not None and (tw < 0 or tw > 999):
-                raise ValueError("Weight must be between 0 and 999 kg")
-            return name, tr, tw, None
+            validated: list[tuple[int | None, float | None]] = []
+            for reps, weight in set_configs:
+                tr = int(reps) if reps is not None else 10
+                if tr < 0 or tr > 999:
+                    raise ValueError("Target reps must be between 0 and 999")
+                tw = weight
+                if tw is not None and (tw < 0 or tw > 999):
+                    raise ValueError("Weight must be between 0 and 999 kg")
+                validated.append((tr, tw))
+            return name, validated, None
         else:
             ts = int(timed_seconds) if timed_seconds is not None else 30
             if ts < 1 or ts > 3600:
                 raise ValueError("Timed duration must be between 1 and 3600 seconds")
-            return name, None, None, ts
+            return name, [(None, None)] * len(set_configs), ts
 
     # mutations
+
+    def rename_workout(self, workout_id: int, name: str) -> None:
+        name = name.strip()
+        if not name:
+            raise ValueError("Workout name is required")
+        if not self._conn.execute(
+            "SELECT id FROM workouts WHERE id = ?", (workout_id,)
+        ).fetchone():
+            raise ValueError("Workout not found")
+        with self._conn:
+            self._conn.execute(
+                "UPDATE workouts SET name = ? WHERE id = ?", (name, workout_id)
+            )
+
+    def duplicate_workout(self, workout_id: int, new_name: str) -> int:
+
+        new_name = new_name.strip()
+        if not new_name:
+            raise ValueError("Workout name is required")
+        plan = self.get_workout_plan(workout_id)
+        if plan is None:
+            raise ValueError("Workout not found")
+        with self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO workouts(name) VALUES (?)", (new_name,)
+            )
+            new_workout_id = int(cur.lastrowid)
+            ex_id_map: dict[int, int] = {}
+            for ex in plan.exercises:
+                new_ex_cur = self._conn.execute(
+                    "INSERT INTO exercises"
+                    "(workout_id, name, exercise_type, order_index, rest_seconds, timed_seconds)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        new_workout_id,
+                        ex.name,
+                        ex.exercise_type,
+                        ex.order_index,
+                        ex.rest_seconds,
+                        ex.timed_seconds,
+                    ),
+                )
+                ex_id_map[ex.id] = int(new_ex_cur.lastrowid)
+            for ex in plan.exercises:
+                new_ex_id = ex_id_map[ex.id]
+                for s in plan.sets_by_exercise_id.get(ex.id, []):
+                    self._conn.execute(
+                        "INSERT INTO sets(exercise_id, order_index, target_reps, target_weight_kg)"
+                        " VALUES (?, ?, ?, ?)",
+                        (new_ex_id, s.order_index, s.target_reps, s.target_weight_kg),
+                    )
+                if ex.superset_group is not None:
+                    self._conn.execute(
+                        "UPDATE exercises SET superset_group = ? WHERE id = ?",
+                        (ex.superset_group, new_ex_id),
+                    )
+        return new_workout_id
 
     def create_workout(self, name: str) -> int:
         name = name.strip()
@@ -271,12 +329,10 @@ class Database:
         exercise_type: str,
         rest_seconds: int,
         timed_seconds: int | None,
-        num_sets: int,
-        target_reps: int | None,
-        target_weight_kg: float | None,
+        set_configs: list[tuple[int | None, float | None]],
     ) -> int:
-        name, tr, tw, ts = self._validate_exercise(
-            name, exercise_type, num_sets, target_reps, target_weight_kg, timed_seconds
+        name, validated_configs, ts = self._validate_exercise(
+            name, exercise_type, set_configs, timed_seconds
         )
         rest_seconds = max(0, min(600, int(rest_seconds)))
 
@@ -299,7 +355,7 @@ class Database:
                 rest_seconds=rest_seconds,
                 timed_seconds=ts,
             )
-            for i in range(num_sets):
+            for i, (tr, tw) in enumerate(validated_configs):
                 self._insert_set(ex_id, i, target_reps=tr, target_weight_kg=tw)
         return ex_id
 
@@ -311,26 +367,24 @@ class Database:
         exercise_type: str,
         rest_seconds: int,
         timed_seconds: int | None,
-        num_sets: int,
-        target_reps: int | None,
-        target_weight_kg: float | None,
+        set_configs: list[tuple[int | None, float | None]],
     ) -> None:
         if not self._conn.execute(
             "SELECT id FROM exercises WHERE id = ?", (exercise_id,)
         ).fetchone():
             raise ValueError("Exercise not found")
-        name, tr, tw, ts = self._validate_exercise(
-            name, exercise_type, num_sets, target_reps, target_weight_kg, timed_seconds
+        name, validated_configs, ts = self._validate_exercise(
+            name, exercise_type, set_configs, timed_seconds
         )
         rest_seconds = max(0, min(600, int(rest_seconds)))
 
         with self._conn:
             self._conn.execute(
                 "UPDATE exercises SET name = ?, exercise_type = ?, rest_seconds = ?, timed_seconds = ? WHERE id = ?",
-                (name.strip(), exercise_type, rest_seconds, ts, exercise_id),
+                (name, exercise_type, rest_seconds, ts, exercise_id),
             )
             self._conn.execute("DELETE FROM sets WHERE exercise_id = ?", (exercise_id,))
-            for i in range(num_sets):
+            for i, (tr, tw) in enumerate(validated_configs):
                 self._insert_set(exercise_id, i, target_reps=tr, target_weight_kg=tw)
 
     def swap_exercise_order(
@@ -464,7 +518,9 @@ class Database:
         )
         return [int(r["day"]) for r in cur.fetchall()]
 
-    def get_sessions_for_date(self, year: int, month: int, day: int) -> list[SessionInfo]:
+    def get_sessions_for_date(
+        self, year: int, month: int, day: int
+    ) -> list[SessionInfo]:
         """Return finished sessions for a specific calendar date, oldest first."""
         date_str = f"{year:04d}-{month:02d}-{day:02d}"
         cur = self._conn.execute(

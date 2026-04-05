@@ -117,6 +117,38 @@ class MainPage(Adw.NavigationPage):
             )
             row.add_controller(gesture)
 
+            rename_btn = Gtk.Button()
+            rename_btn.set_icon_name("document-edit-symbolic")
+            rename_btn.set_valign(Gtk.Align.CENTER)
+            rename_btn.connect(
+                "clicked",
+                lambda _btn, workout_id=w.id, workout_name=w.name: (
+                    self._show_rename_dialog(workout_id, workout_name)
+                ),
+            )
+            style_header_icon_button(
+                rename_btn,
+                tooltip=f"Rename \u2018{w.name}\u2019",
+                accessible_name=f"Rename {w.name}",
+            )
+            row.add_suffix(rename_btn)
+
+            duplicate_btn = Gtk.Button()
+            duplicate_btn.set_icon_name("edit-copy-symbolic")
+            duplicate_btn.set_valign(Gtk.Align.CENTER)
+            duplicate_btn.connect(
+                "clicked",
+                lambda _btn, workout_id=w.id, workout_name=w.name: (
+                    self._show_duplicate_dialog(workout_id, workout_name)
+                ),
+            )
+            style_header_icon_button(
+                duplicate_btn,
+                tooltip=f"Duplicate \u2018{w.name}\u2019",
+                accessible_name=f"Duplicate {w.name}",
+            )
+            row.add_suffix(duplicate_btn)
+
             delete_btn = Gtk.Button()
             delete_btn.set_icon_name("user-trash-symbolic")
             delete_btn.set_valign(Gtk.Align.CENTER)
@@ -138,6 +170,77 @@ class MainPage(Adw.NavigationPage):
             self._workouts_stack.set_visible_child_name("list")
         else:
             self._workouts_stack.set_visible_child_name("empty")
+
+    def _show_rename_dialog(self, workout_id: int, current_name: str) -> None:
+        dialog = Adw.AlertDialog()
+        dialog.set_heading("Rename Workout")
+
+        name_row = Adw.EntryRow(title="Name")
+        name_row.set_text(current_name)
+        dialog.set_extra_child(name_row)
+
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("save", "Save")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("save")
+        dialog.set_close_response("cancel")
+        dialog.set_response_enabled("save", bool(current_name.strip()))
+
+        name_row.connect(
+            "changed",
+            lambda _r: dialog.set_response_enabled(
+                "save", bool(name_row.get_text().strip())
+            ),
+        )
+
+        def on_response(_d: Adw.AlertDialog, response: str) -> None:
+            if response != "save":
+                return
+            try:
+                self.db.rename_workout(workout_id, name_row.get_text().strip())
+            except ValueError as exc:
+                self._show_error(str(exc))
+                return
+            self.refresh()
+
+        dialog.connect("response", on_response)
+        present_dialog(dialog, self)
+
+    def _show_duplicate_dialog(self, workout_id: int, source_name: str) -> None:
+        dialog = Adw.AlertDialog()
+        dialog.set_heading("Duplicate Workout")
+        dialog.set_body("Choose a name for the copy.")
+
+        name_row = Adw.EntryRow(title="Name")
+        name_row.set_text(f"Copy of {source_name}")
+        dialog.set_extra_child(name_row)
+
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("duplicate", "Duplicate")
+        dialog.set_response_appearance("duplicate", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response("duplicate")
+        dialog.set_close_response("cancel")
+        dialog.set_response_enabled("duplicate", True)
+
+        name_row.connect(
+            "changed",
+            lambda _r: dialog.set_response_enabled(
+                "duplicate", bool(name_row.get_text().strip())
+            ),
+        )
+
+        def on_response(_d: Adw.AlertDialog, response: str) -> None:
+            if response != "duplicate":
+                return
+            try:
+                self.db.duplicate_workout(workout_id, name_row.get_text().strip())
+            except ValueError as exc:
+                self._show_error(str(exc))
+                return
+            self.refresh()
+
+        dialog.connect("response", on_response)
+        present_dialog(dialog, self)
 
     def _confirm_delete_workout(self, workout_id: int, workout_name: str) -> None:
         dialog = Adw.AlertDialog()
