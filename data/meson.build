@@ -28,12 +28,12 @@ metainfo_file = install_data(
 )
 
 install_data(
-  'screenshots/main-window.png',
-  'screenshots/workout-detail.png',
-  'screenshots/workout-run.png',
-  'screenshots/rest-timer.png',
+  'screenshots/workouts-tab.png',
+  'screenshots/workout-example.png',
+  'screenshots/rep-exercise.png',
+  'screenshots/hold-exercise.png',
   'screenshots/workout-complete.png',
-  'screenshots/history.png',
+  'screenshots/history-tab.png',
   install_dir: get_option('datadir') / 'metainfo/screenshots',
 )
 
