@@ -8,3 +8,4 @@ __pycache__/
 _build/
 _flatpak_build/
 .flatpak-builder/
+data/gschemas.compiled
