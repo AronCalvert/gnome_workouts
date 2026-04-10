@@ -10,14 +10,12 @@ finish-args:
   - --socket=wayland
   - --device=dri
   - --socket=pulseaudio
-  - --filesystem=xdg-run/dconf
-  - --filesystem=~/.config/dconf:ro
-  - --env=DCONF_USER_CONFIG_DIR=.config/dconf
+  - --talk-name=ca.desrt.dconf
 
 modules:
   - name: workouts
     buildsystem: meson
     sources:
       - type: archive
-        url: https://github.com/AronCalvert/gnome-workouts/archive/refs/tags/v0.1.0.tar.gz
-        sha256: 0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5
+        url: https://github.com/AronCalvert/workouts/archive/refs/tags/v0.1.0.tar.gz
+        sha256: 8d0114e7ae55441fc2c0aa8fe92ae07ace970014a3177da539fa1e367d69c26c
