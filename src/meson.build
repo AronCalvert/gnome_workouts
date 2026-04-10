@@ -5,6 +5,7 @@ workouts_sources = files(
   'db.py',
   'models.py',
   'prefs.py',
+  'sound.py',
   'ui_utils.py',
   'window.py',
 )

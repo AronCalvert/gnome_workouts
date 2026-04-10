@@ -1,15 +1,14 @@
-desktop_file = i18n.merge_file(
-  input: 'io.github.AronCalvert.Workouts.desktop.in',
-  output: 'io.github.AronCalvert.Workouts.desktop',
-  type: 'desktop',
-  po_dir: '../po',
-  install: true,
+desktop_file = install_data(
+  'io.github.AronCalvert.Workouts.desktop.in',
+  rename: 'io.github.AronCalvert.Workouts.desktop',
   install_dir: get_option('datadir') / 'applications',
 )
 
 desktop_utils = find_program('desktop-file-validate', required: false)
 if desktop_utils.found()
-  test('Validate desktop file', desktop_utils, args: [desktop_file])
+  test('Validate desktop file', desktop_utils,
+    args: [get_option('datadir') / 'applications' / 'io.github.AronCalvert.Workouts.desktop'],
+  )
 endif
 
 install_data(
@@ -22,11 +21,9 @@ install_data(
   install_dir: get_option('datadir') / 'icons/hicolor/symbolic/apps',
 )
 
-metainfo_file = i18n.merge_file(
-  input: 'io.github.AronCalvert.Workouts.metainfo.xml.in',
-  output: 'io.github.AronCalvert.Workouts.metainfo.xml',
-  po_dir: '../po',
-  install: true,
+metainfo_file = install_data(
+  'io.github.AronCalvert.Workouts.metainfo.xml.in',
+  rename: 'io.github.AronCalvert.Workouts.metainfo.xml',
   install_dir: get_option('datadir') / 'metainfo',
 )
 
@@ -42,5 +39,12 @@ install_data(
 
 appstream_util = find_program('appstream-util', required: false)
 if appstream_util.found()
-  test('Validate metainfo file', appstream_util, args: ['validate', metainfo_file])
+  test('Validate metainfo file', appstream_util,
+    args: ['validate', get_option('datadir') / 'metainfo' / 'io.github.AronCalvert.Workouts.metainfo.xml'],
+  )
 endif
+
+install_data(
+  'io.github.AronCalvert.Workouts.gschema.xml',
+  install_dir: get_option('datadir') / 'glib-2.0/schemas',
+)

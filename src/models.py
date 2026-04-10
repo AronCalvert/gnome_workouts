@@ -60,3 +60,4 @@ class SessionPerformedLine:
     reps: int | None
     weight_kg: float | None
     duration_seconds: int | None
+    notes: str | None = None

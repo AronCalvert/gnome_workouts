@@ -10,19 +10,15 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gdk, Gtk
 
 from ..models import SessionInfo, SessionPerformedLine
-from ..ui_utils import *
-
-
-def _format_set_detail(line: SessionPerformedLine) -> str:
-    if line.exercise_type == "timed":
-        sec = line.duration_seconds if line.duration_seconds is not None else 0
-        return f"{sec}s hold"
-    parts: list[str] = []
-    if line.reps is not None:
-        parts.append(f"{line.reps} reps")
-    if line.weight_kg is not None:
-        parts.append(f"{line.weight_kg:g} kg")
-    return ", ".join(parts) if parts else "\u2014"
+from ..ui_utils import (
+    clear_container,
+    create_boxed_listbox,
+    format_set_detail,
+    group_session_lines,
+    present_dialog,
+    set_margins,
+    style_header_icon_button,
+)
 
 
 class HistoryPage(Gtk.Box):
@@ -75,6 +71,7 @@ class HistoryPage(Gtk.Box):
 
         self.append(scroll)
         self._refresh_marks()
+        self._show_selected_day()
 
     @property
     def _db(self):
@@ -104,6 +101,11 @@ class HistoryPage(Gtk.Box):
 
         sessions = self._db.get_sessions_for_date(year, month, day)
         if not sessions:
+            label = Gtk.Label(label="No workouts on this day")
+            label.add_css_class("dim-label")
+            label.set_halign(Gtk.Align.CENTER)
+            set_margins(label, top=12)
+            self._detail_container.append(label)
             return
 
         heading = Gtk.Label(label=pydt.date(year, month, day).strftime("%A, %B %-d"))
@@ -113,7 +115,10 @@ class HistoryPage(Gtk.Box):
 
         session_list = create_boxed_listbox()
         for si in sessions:
-            time_str = pydt.datetime.fromisoformat(si.started_at).strftime("%H:%M")
+            try:
+                time_str = pydt.datetime.fromisoformat(si.started_at).strftime("%H:%M")
+            except (ValueError, TypeError):
+                time_str = si.started_at
             row = Adw.ActionRow(title=si.workout_name, subtitle=time_str)
             row.set_activatable(True)
             row.connect("activated", lambda _r, s=si: self._open_session_dialog(s))
@@ -135,8 +140,12 @@ class HistoryPage(Gtk.Box):
     def _confirm_delete_session(self, si: SessionInfo) -> None:
         dialog = Adw.AlertDialog()
         dialog.set_heading("Delete Session?")
+        try:
+            time_str = pydt.datetime.fromisoformat(si.started_at).strftime("%H:%M")
+        except (ValueError, TypeError):
+            time_str = si.started_at
         dialog.set_body(
-            f"Remove the \u201c{si.workout_name}\u201d session at {pydt.datetime.fromisoformat(si.started_at).strftime("%H:%M")}? "
+            f"Remove the \u201c{si.workout_name}\u201d session at {time_str}? "
             "This cannot be undone."
         )
         dialog.add_response("cancel", "Cancel")
@@ -157,7 +166,10 @@ class HistoryPage(Gtk.Box):
 
     def _open_session_dialog(self, si: SessionInfo) -> None:
         lines = self._db.get_session_performed_lines(si.session_id)
-        time_str = pydt.datetime.fromisoformat(si.started_at).strftime("%H:%M")
+        try:
+            time_str = pydt.datetime.fromisoformat(si.started_at).strftime("%H:%M")
+        except (ValueError, TypeError):
+            time_str = si.started_at
 
         content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
         set_margins(content_box, top=18, bottom=18, start=18, end=18)
@@ -173,12 +185,7 @@ class HistoryPage(Gtk.Box):
             empty_label.set_halign(Gtk.Align.CENTER)
             content_box.append(empty_label)
         else:
-            groups: list[tuple[str, list[SessionPerformedLine]]] = []
-            for line in lines:
-                if groups and groups[-1][0] == line.exercise_name:
-                    groups[-1][1].append(line)
-                else:
-                    groups.append((line.exercise_name, [line]))
+            groups = group_session_lines(lines)
 
             for ex_name, ex_lines in groups:
                 group_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -191,10 +198,7 @@ class HistoryPage(Gtk.Box):
                 set_list = create_boxed_listbox()
                 for line in ex_lines:
                     row = Adw.ActionRow(title=f"Set {line.set_number}")
-                    detail = Gtk.Label(label=_format_set_detail(line))
-                    detail.add_css_class("dim-label")
-                    detail.set_valign(Gtk.Align.CENTER)
-                    row.add_suffix(detail)
+                    row.set_subtitle(format_set_detail(line, self._app.prefs))
                     set_list.append(row)
                 group_box.append(set_list)
                 content_box.append(group_box)
@@ -219,4 +223,4 @@ class HistoryPage(Gtk.Box):
         dialog.set_content_width(600)
         dialog.set_content_height(560)
         dialog.set_child(toolbar)
-        dialog.present(self)
+        present_dialog(dialog, self)

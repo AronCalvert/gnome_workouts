@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 import sqlite3
 from pathlib import Path
@@ -14,11 +15,15 @@ from .models import (
 )
 
 
+def _now() -> str:
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 class Database:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path)
+        self._conn = sqlite3.connect(self._db_path, timeout=30.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
 
@@ -91,13 +96,16 @@ class Database:
         self._migrate()
 
     def _migrate(self) -> None:
-        try:
-            self._conn.execute(
-                "ALTER TABLE exercises ADD COLUMN superset_group INTEGER DEFAULT NULL"
-            )
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # column already exists
+        for stmt in [
+            "ALTER TABLE exercises ADD COLUMN superset_group INTEGER DEFAULT NULL",
+            "ALTER TABLE performed_sets ADD COLUMN notes TEXT",
+        ]:
+            try:
+                self._conn.execute(stmt)
+                self._conn.commit()
+            except sqlite3.OperationalError as e:
+                if "duplicate column name" not in str(e):
+                    raise
 
     # row mappers
 
@@ -213,7 +221,7 @@ class Database:
         cur = self._conn.execute(
             """
             SELECT e.name AS exercise_name, e.exercise_type, ps.order_index AS set_ord,
-                   ps.reps, ps.weight_kg, ps.duration_seconds
+                   ps.reps, ps.weight_kg, ps.duration_seconds, ps.notes
             FROM performed_sets ps
             JOIN exercises e ON e.id = ps.exercise_id
             WHERE ps.session_id = ? AND ps.completed = 1
@@ -231,6 +239,7 @@ class Database:
                 duration_seconds=int(r["duration_seconds"])
                 if r["duration_seconds"] is not None
                 else None,
+                notes=str(r["notes"]) if r["notes"] is not None else None,
             )
             for r in cur.fetchall()
         ]
@@ -285,7 +294,6 @@ class Database:
             )
 
     def duplicate_workout(self, workout_id: int, new_name: str) -> int:
-
         new_name = new_name.strip()
         if not new_name:
             raise ValueError("Workout name is required")
@@ -577,8 +585,38 @@ class Database:
                 (workout_id, workout_id),
             )
 
+    def consolidate_superset(self, workout_id: int, exercise_ids: list[int]) -> None:
+        """Reorder exercises so all superset members are contiguous, anchored at the
+        position of whichever member currently appears first in the workout order."""
+        member_set = set(exercise_ids)
+        rows = self._conn.execute(
+            "SELECT id FROM exercises WHERE workout_id = ? ORDER BY order_index ASC",
+            (workout_id,),
+        ).fetchall()
+        ids = [int(r["id"]) for r in rows]
+
+        members = [eid for eid in ids if eid in member_set]
+        others = [eid for eid in ids if eid not in member_set]
+
+        # Find where the first member sits, then adjust for members that precede it
+        # (they'll be pulled out of `others`, shifting the insertion point down)
+        first_pos = next((i for i, eid in enumerate(ids) if eid in member_set), None)
+        if first_pos is None:
+            return
+        members_before_first = sum(1 for eid in ids[:first_pos] if eid in member_set)
+        insert_pos = first_pos - members_before_first
+
+        new_order = others[:insert_pos] + members + others[insert_pos:]
+        with self._conn:
+            for i, eid in enumerate(new_order):
+                self._conn.execute(
+                    "UPDATE exercises SET order_index = ? WHERE id = ?", (i, eid)
+                )
+
     def get_sessions_for_month(self, year: int, month: int) -> list[int]:
         """Return day-of-month numbers (1–31) that have at least one finished session."""
+        if not (1 <= month <= 12):
+            raise ValueError(f"Month must be 1–12, got {month}")
         month_str = f"{year:04d}-{month:02d}"
         cur = self._conn.execute(
             """
@@ -594,6 +632,10 @@ class Database:
         self, year: int, month: int, day: int
     ) -> list[SessionInfo]:
         """Return finished sessions for a specific calendar date, oldest first."""
+        if not (1 <= month <= 12):
+            raise ValueError(f"Month must be 1–12, got {month}")
+        if not (1 <= day <= 31):
+            raise ValueError(f"Day must be 1–31, got {day}")
         date_str = f"{year:04d}-{month:02d}-{day:02d}"
         cur = self._conn.execute(
             """
@@ -617,7 +659,8 @@ class Database:
     def start_session(self, workout_id: int) -> int:
         with self._conn:
             cur = self._conn.execute(
-                "INSERT INTO workout_sessions(workout_id) VALUES (?)", (workout_id,)
+                "INSERT INTO workout_sessions(workout_id, started_at) VALUES (?, ?)",
+                (workout_id, _now()),
             )
         return int(cur.lastrowid)
 
@@ -630,8 +673,8 @@ class Database:
     def finish_session(self, session_id: int) -> None:
         with self._conn:
             self._conn.execute(
-                "UPDATE workout_sessions SET finished_at = datetime('now') WHERE id = ? AND finished_at IS NULL",
-                (session_id,),
+                "UPDATE workout_sessions SET finished_at = ? WHERE id = ? AND finished_at IS NULL",
+                (_now(), session_id),
             )
 
     def set_performed_set(
@@ -645,16 +688,19 @@ class Database:
         reps: int | None,
         weight_kg: float | None,
         duration_seconds: int | None,
+        notes: str | None = None,
     ) -> None:
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO performed_sets(
-                  session_id, exercise_id, set_id, order_index, reps, weight_kg, duration_seconds, completed
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  session_id, exercise_id, set_id, order_index, reps, weight_kg,
+                  duration_seconds, completed, notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, exercise_id, order_index) DO UPDATE SET
                   set_id = excluded.set_id, reps = excluded.reps, weight_kg = excluded.weight_kg,
-                  duration_seconds = excluded.duration_seconds, completed = excluded.completed
+                  duration_seconds = excluded.duration_seconds, completed = excluded.completed,
+                  notes = excluded.notes
                 """,
                 (
                     session_id,
@@ -665,6 +711,7 @@ class Database:
                     weight_kg,
                     duration_seconds,
                     1 if completed else 0,
+                    notes,
                 ),
             )
 
@@ -707,9 +754,17 @@ def default_db_path(app_id: str) -> Path:
 
 
 def open_default_db(app_id: str) -> Database:
+    path = default_db_path(app_id)
     try:
-        db = Database(default_db_path(app_id))
+        db = Database(path)
     except PermissionError:
-        db = Database(Path.cwd() / ".data" / "workouts.db")
+        import sys
+        fallback = Path.cwd() / ".data" / "workouts.db"
+        print(
+            f"Warning: cannot open database at {path!r}, "
+            f"falling back to {fallback!r}.",
+            file=sys.stderr,
+        )
+        db = Database(fallback)
     db.init_schema()
     return db

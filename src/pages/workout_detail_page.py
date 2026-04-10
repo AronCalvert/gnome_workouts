@@ -7,10 +7,40 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gdk, GObject, Gtk
+from gi.repository import Adw, Gdk, GLib, GObject, Gtk
 
 from ..models import SetPlan
-from ..ui_utils import *
+
+_css_registered = False
+from ..ui_utils import (
+    clear_container,
+    create_boxed_listbox,
+    create_header_button,
+    present_dialog,
+    set_accessible_label,
+    set_margins,
+    style_header_icon_button,
+)
+
+
+def _read_set_configs(
+    f: "_ExerciseForm", prefs: object
+) -> tuple[str, list[tuple[int | None, float | None]]]:
+    """Extract exercise type and set configs from a filled exercise form."""
+    typ = "reps" if f.type_dd.get_selected() == 0 else "timed"
+    if typ == "reps":
+        configs: list[tuple[int | None, float | None]] = [
+            (
+                int(r_adj.get_value()),
+                prefs.display_to_kg(float(w_adj.get_value()))  # type: ignore[union-attr]
+                if float(w_adj.get_value()) > 0
+                else None,
+            )
+            for r_adj, w_adj in f.set_adjs
+        ]
+    else:
+        configs = [(None, None)] * int(f.sets_adj.get_value())
+    return typ, configs
 
 
 @dataclass
@@ -73,12 +103,35 @@ class WorkoutDetailPage(Adw.NavigationPage):
         toolbar.add_top_bar(header)
         toolbar.set_content(self._toast_overlay)
         self.set_child(toolbar)
+        self._plan = None
+        GLib.idle_add(self._reload)
 
-        self._reload()
+        global _css_registered
+        if not _css_registered:
+            _css_registered = True
+            _css = Gtk.CssProvider()
+            _css.load_from_string("""
+                .superset-marker {
+                    background-color: @accent_color;
+                    border-radius: 2px;
+                    min-width: 4px;
+                    margin-top: 6px;
+                    margin-bottom: 6px;
+                }
+            """)
+            Gtk.StyleContext.add_provider_for_display(
+                Gdk.Display.get_default(),
+                _css,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+            )
 
     @property
     def _db(self):
         return self._app.db
+
+    @property
+    def plan(self):
+        return self._plan
 
     def _show_error(self, message: str) -> None:
         self._toast_overlay.add_toast(Adw.Toast(title=message))
@@ -114,9 +167,20 @@ class WorkoutDetailPage(Adw.NavigationPage):
                 "activated", lambda _r, eid=ex.id: self._open_edit_exercise_dialog(eid)
             )
 
+            if ex.superset_group is not None:
+                marker = Gtk.Box()
+                marker.add_css_class("superset-marker")
+                row.add_prefix(marker)
+
+            in_superset = ex.superset_group is not None
             handle = Gtk.Image.new_from_icon_name("list-drag-handle-symbolic")
             handle.set_valign(Gtk.Align.CENTER)
             handle.add_css_class("dim-label")
+            handle.set_tooltip_text(
+                "Drag to reorder within superset only"
+                if in_superset
+                else "Drag to reorder"
+            )
             row.add_prefix(handle)
 
             drag_src = Gtk.DragSource.new()
@@ -138,8 +202,8 @@ class WorkoutDetailPage(Adw.NavigationPage):
             drop_tgt = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
             drop_tgt.connect(
                 "drop",
-                lambda _t, value, _x, _y, tidx=i: self._on_exercise_drop(
-                    int(value), tidx
+                lambda _t, value, _x, _y, tidx=i, r=row: self._on_exercise_drop(
+                    int(value), tidx, _y, r
                 ),
             )
             row.add_controller(drop_tgt)
@@ -158,17 +222,7 @@ class WorkoutDetailPage(Adw.NavigationPage):
             row.add_suffix(del_btn)
 
             n_sets = len(sets)
-            parts = [f"{n_sets} {'set' if n_sets == 1 else 'sets'}"]
-            if ex.superset_group is not None:
-                partners = [
-                    e
-                    for e in plan.exercises
-                    if e.id != ex.id and e.superset_group == ex.superset_group
-                ]
-                if partners:
-                    names = ", ".join(p.name for p in partners)
-                    parts.append(f"Superset with {names}")
-            row.set_subtitle(" \u2022 ".join(parts))
+            row.set_subtitle(f"{n_sets} {'set' if n_sets == 1 else 'sets'}")
             list_box.append(row)
 
         self._body.append(list_box)
@@ -383,22 +437,70 @@ class WorkoutDetailPage(Adw.NavigationPage):
     def _on_begin_clicked(self, _btn: Gtk.Button) -> None:
         self.emit("begin-workout", int(self._workout_id))
 
-    def _move_exercise(self, exercise_id_a: int, exercise_id_b: int) -> None:
-        try:
-            self._db.swap_exercise_order(self._workout_id, exercise_id_a, exercise_id_b)
-        except ValueError as exc:
-            self._show_error(str(exc))
-            return
-        self._reload()
-
-    def _on_exercise_drop(self, dragged_id: int, target_index: int) -> bool:
-        try:
-            self._db.move_exercise_to_position(
-                self._workout_id, dragged_id, target_index
-            )
-        except ValueError as exc:
-            self._show_error(str(exc))
+    def _on_exercise_drop(
+        self,
+        dragged_id: int,
+        target_index: int,
+        drop_y: float = 0,
+        target_row: Gtk.Widget | None = None,
+    ) -> bool:
+        exercises = self._plan.exercises
+        dragged_ex = next((ex for ex in exercises if ex.id == dragged_id), None)
+        if dragged_ex is None:
             return False
+
+        target_index = max(0, min(target_index, len(exercises) - 1))
+        target_ex = exercises[target_index]
+
+        if target_ex.id == dragged_id:
+            return False
+
+        dragged_group = dragged_ex.superset_group
+
+        if dragged_group is not None:
+            if target_ex.superset_group != dragged_group:
+                self._show_error(
+                    "Superset exercises can only be reordered within their group."
+                )
+                return False
+            try:
+                self._db.swap_exercise_order(self._workout_id, dragged_id, target_ex.id)
+            except ValueError as exc:
+                self._show_error(str(exc))
+                return False
+        else:
+            if target_ex.superset_group is not None:
+                row_height = target_row.get_height() if target_row is not None else 0
+                drop_after = drop_y > row_height / 2
+
+                cluster_indices = [
+                    i
+                    for i, ex in enumerate(exercises)
+                    if ex.superset_group == target_ex.superset_group
+                ]
+                dragged_idx = next(
+                    i for i, ex in enumerate(exercises) if ex.id == dragged_id
+                )
+
+                if drop_after:
+                    raw_target = cluster_indices[-1] + 1
+                    target_index = (
+                        raw_target - 1 if dragged_idx < raw_target else raw_target
+                    )
+                else:
+                    raw_target = cluster_indices[0]
+                    target_index = (
+                        raw_target - 1 if dragged_idx < raw_target else raw_target
+                    )
+
+            try:
+                self._db.move_exercise_to_position(
+                    self._workout_id, dragged_id, target_index
+                )
+            except ValueError as exc:
+                self._show_error(str(exc))
+                return False
+
         self._reload()
         return True
 
@@ -525,19 +627,7 @@ class WorkoutDetailPage(Adw.NavigationPage):
         def on_response(_d: Adw.AlertDialog, response: str) -> None:
             if response != "save":
                 return
-            typ = "reps" if f.type_dd.get_selected() == 0 else "timed"
-            if typ == "reps":
-                set_configs: list[tuple[int | None, float | None]] = [
-                    (
-                        int(r_adj.get_value()),
-                        prefs.display_to_kg(float(w_adj.get_value()))
-                        if float(w_adj.get_value()) > 0
-                        else None,
-                    )
-                    for r_adj, w_adj in f.set_adjs
-                ]
-            else:
-                set_configs = [(None, None)] * int(f.sets_adj.get_value())
+            typ, set_configs = _read_set_configs(f, prefs)
             try:
                 self._db.update_exercise(
                     exercise_id,
@@ -572,9 +662,11 @@ class WorkoutDetailPage(Adw.NavigationPage):
                                 self._workout_id, new_id
                             )
                     if new_superset_ids:
+                        all_member_ids = [exercise_id] + list(new_superset_ids)
                         self._db.set_exercises_as_superset(
-                            self._workout_id, [exercise_id] + list(new_superset_ids)
+                            self._workout_id, all_member_ids
                         )
+                        self._db.consolidate_superset(self._workout_id, all_member_ids)
 
             self._reload()
 
@@ -604,19 +696,7 @@ class WorkoutDetailPage(Adw.NavigationPage):
         def on_response(_d: Adw.AlertDialog, response: str) -> None:
             if response != "add":
                 return
-            typ = "reps" if f.type_dd.get_selected() == 0 else "timed"
-            if typ == "reps":
-                set_configs: list[tuple[int | None, float | None]] = [
-                    (
-                        int(r_adj.get_value()),
-                        prefs.display_to_kg(float(w_adj.get_value()))
-                        if float(w_adj.get_value()) > 0
-                        else None,
-                    )
-                    for r_adj, w_adj in f.set_adjs
-                ]
-            else:
-                set_configs = [(None, None)] * int(f.sets_adj.get_value())
+            typ, set_configs = _read_set_configs(f, prefs)
             try:
                 self._db.add_exercise_to_workout(
                     self._workout_id,

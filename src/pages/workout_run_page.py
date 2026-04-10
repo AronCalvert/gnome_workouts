@@ -13,19 +13,16 @@ from ..db import Database
 from ..models import ExercisePlan, SetPlan, WorkoutPlan, SessionPerformedLine
 from ..prefs import Preferences
 from ..widgets.timer_widget import CountdownTimer
-from ..ui_utils import *
-
-
-def _format_set_detail(line: SessionPerformedLine) -> str:
-    if line.exercise_type == "timed":
-        sec = line.duration_seconds if line.duration_seconds is not None else 0
-        return f"{sec}s hold"
-    parts: list[str] = []
-    if line.reps is not None:
-        parts.append(f"{line.reps} reps")
-    if line.weight_kg is not None:
-        parts.append(f"{line.weight_kg:g} kg")
-    return ", ".join(parts) if parts else "\u2014"
+from .. import sound
+from ..ui_utils import (
+    clear_container,
+    create_boxed_listbox,
+    format_set_detail,
+    group_session_lines,
+    present_dialog,
+    set_accessible_label,
+    set_margins,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,8 +40,6 @@ class _WorkoutStep:
 
 
 def _build_steps(plan: WorkoutPlan) -> list[_WorkoutStep]:
-    """Build a flat ordered list of workout steps, with superset interleaving."""
-    # Build ordered groups (solo exercises or superset clusters)
     ordered_groups: list[list[ExercisePlan]] = []
     seen_groups: set[int] = set()
     for ex in plan.exercises:
@@ -57,7 +52,6 @@ def _build_steps(plan: WorkoutPlan) -> list[_WorkoutStep]:
             ]
             ordered_groups.append(cluster)
 
-    # Keep only groups that have at least one set
     non_empty = [
         g
         for g in ordered_groups
@@ -72,11 +66,10 @@ def _build_steps(plan: WorkoutPlan) -> list[_WorkoutStep]:
         is_superset = len(group) > 1
         all_sets = [plan.sets_by_exercise_id.get(ex.id, []) for ex in group]
         max_rounds = max(len(s) for s in all_sets)
-        # Rest comes from the last exercise in the group
+
         group_rest = group[-1].rest_seconds
 
         for round_idx in range(max_rounds):
-            # Collect the exercises that have a set for this round
             round_entries: list[tuple[ExercisePlan, SetPlan, int]] = []
             for ex_pos, ex in enumerate(group):
                 ex_sets = plan.sets_by_exercise_id.get(ex.id, [])
@@ -130,6 +123,7 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._step_index = 0
         self._reps_row: Adw.SpinRow | None = None
         self._weight_row: Adw.SpinRow | None = None
+        self._notes_row: Adw.EntryRow | None = None
         self._last_logged: dict[int, tuple[int, float | None]] = {}
 
         header = Adw.HeaderBar()
@@ -186,6 +180,12 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._set_list = create_boxed_listbox()
         self._active_section.append(self._set_list)
 
+        self._hold_timer = CountdownTimer(pill=True, show_reset=False, play_ticks=True)
+        set_accessible_label(self._hold_timer, "Hold timer")
+        self._hold_timer.connect("finished", self._on_hold_finished)
+        self._hold_timer.set_visible(False)
+        self._active_section.append(self._hold_timer)
+
         active_btns = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         active_btns.set_halign(Gtk.Align.CENTER)
 
@@ -202,7 +202,16 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._skip_btn.connect("clicked", self._on_skip_set_clicked)
         active_btns.append(self._skip_btn)
 
+        self._active_btns = active_btns
         self._active_section.append(active_btns)
+
+        self._skip_hold_btn = Gtk.Button(label="Skip Hold")
+        self._skip_hold_btn.add_css_class("flat")
+        self._skip_hold_btn.set_tooltip_text("Skip this hold without logging")
+        self._skip_hold_btn.set_halign(Gtk.Align.CENTER)
+        self._skip_hold_btn.set_visible(False)
+        self._skip_hold_btn.connect("clicked", self._on_skip_hold_clicked)
+        self._active_section.append(self._skip_hold_btn)
         outer.append(self._active_section)
 
         self._rest_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
@@ -218,7 +227,7 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._rest_next_label.set_halign(Gtk.Align.CENTER)
         self._rest_section.append(self._rest_next_label)
 
-        self._rest_timer = CountdownTimer(pill=True, show_reset=False)
+        self._rest_timer = CountdownTimer(pill=True, show_reset=False, play_ticks=True)
         set_accessible_label(self._rest_timer, "Rest timer")
         self._rest_timer.connect("finished", self._on_rest_finished)
         self._rest_section.append(self._rest_timer)
@@ -287,6 +296,7 @@ class WorkoutRunPage(Adw.NavigationPage):
         clear_container(self._set_list)
         self._reps_row = None
         self._weight_row = None
+        self._notes_row = None
 
         if self._step_index >= len(self._steps):
             self._end_session()
@@ -317,11 +327,17 @@ class WorkoutRunPage(Adw.NavigationPage):
             )
 
         if ex.exercise_type == "timed":
-            seconds = ex.timed_seconds or 0
-            row = Adw.ActionRow(title="Hold Duration")
-            row.set_subtitle(f"{seconds} seconds")
-            self._set_list.append(row)
+            self._set_list.set_visible(False)
+            self._active_btns.set_visible(False)
+            self._hold_timer.set_duration(ex.timed_seconds or 0)
+            self._hold_timer.set_visible(True)
+            self._skip_hold_btn.set_visible(True)
+            self._hold_timer.start()
         else:
+            self._set_list.set_visible(True)
+            self._active_btns.set_visible(True)
+            self._hold_timer.set_visible(False)
+            self._skip_hold_btn.set_visible(False)
             last = self._last_logged.get(ex.id)
             default_reps = last[0] if last is not None else (cur_set.target_reps or 0)
             default_weight_kg = (
@@ -356,6 +372,10 @@ class WorkoutRunPage(Adw.NavigationPage):
             self._set_list.append(reps)
             self._set_list.append(weight)
 
+        notes_row = Adw.EntryRow(title="Notes (optional)")
+        self._notes_row = notes_row
+        self._set_list.append(notes_row)
+
         self._show_section(self._active_section)
 
     def _start_rest(self, seconds: int, next_name: str) -> None:
@@ -365,8 +385,10 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._show_section(self._rest_section)
 
     def _end_session(self) -> None:
-        self._rest_timer.set_duration(0)
+        self._hold_timer.reset()
+        self._rest_timer.reset()
         self._db.finish_session(self._session_id)
+        sound.play("complete")
         self._populate_summary()
         self._show_section(self._complete_section)
         self._finish_btn.set_visible(False)
@@ -383,12 +405,7 @@ class WorkoutRunPage(Adw.NavigationPage):
             self._summary_container.append(empty_list)
             return
 
-        groups: list[tuple[str, list[SessionPerformedLine]]] = []
-        for line in lines:
-            if groups and groups[-1][0] == line.exercise_name:
-                groups[-1][1].append(line)
-            else:
-                groups.append((line.exercise_name, [line]))
+        groups = group_session_lines(lines)
 
         for ex_name, ex_lines in groups:
             group_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -401,11 +418,65 @@ class WorkoutRunPage(Adw.NavigationPage):
             set_list = create_boxed_listbox()
             for line in ex_lines:
                 row = Adw.ActionRow(title=f"Set {line.set_number}")
-                row.set_subtitle(_format_set_detail(line))
+                row.set_subtitle(format_set_detail(line, self._prefs))
                 set_list.append(row)
             group_box.append(set_list)
 
             self._summary_container.append(group_box)
+
+        total_kg = sum(
+            (line.reps or 0) * line.weight_kg
+            for line in lines
+            if line.exercise_type == "reps"
+            and line.weight_kg is not None
+            and line.weight_kg > 0
+        )
+        if total_kg > 0:
+            vol_display = self._prefs.kg_to_display(total_kg)
+            vol_list = create_boxed_listbox()
+            vol_row = Adw.ActionRow(title="Total Volume")
+            vol_row.set_subtitle(f"{vol_display:g} {self._prefs.weight_label}")
+            vol_list.append(vol_row)
+            self._summary_container.append(vol_list)
+
+    def _on_hold_finished(self, _timer: CountdownTimer) -> None:
+        if self._step_index >= len(self._steps):
+            return
+        step = self._steps[self._step_index]
+        ex = step.exercise
+        cur_set = step.set_plan
+
+        sound.play("complete")
+
+        self._db.set_performed_set(
+            session_id=self._session_id,
+            exercise_id=ex.id,
+            set_id=cur_set.id,
+            order_index=cur_set.order_index,
+            completed=True,
+            reps=None,
+            weight_kg=None,
+            duration_seconds=int(ex.timed_seconds or 0),
+            notes=None,
+        )
+
+        rest = step.rest_after
+        self._step_index += 1
+
+        if self._step_index >= len(self._steps):
+            self._end_session()
+        elif rest > 0:
+            next_step = self._steps[self._step_index]
+            self._start_rest(rest, next_step.exercise.name)
+        else:
+            self._render_current()
+
+    def _on_skip_hold_clicked(self, _btn: Gtk.Button) -> None:
+        self._hold_timer.reset()
+        if self._step_index >= len(self._steps):
+            return
+        self._step_index += 1
+        self._render_current()
 
     def _on_complete_clicked(self, _btn: Gtk.Button) -> None:
         if self._step_index >= len(self._steps):
@@ -428,6 +499,7 @@ class WorkoutRunPage(Adw.NavigationPage):
             weight = None if w <= 0.0 else self._prefs.display_to_kg(w)
             self._last_logged[ex.id] = (reps, weight)
 
+        notes_text = self._notes_row.get_text().strip() if self._notes_row else ""
         self._db.set_performed_set(
             session_id=self._session_id,
             exercise_id=ex.id,
@@ -437,6 +509,7 @@ class WorkoutRunPage(Adw.NavigationPage):
             reps=reps,
             weight_kg=weight,
             duration_seconds=duration,
+            notes=notes_text if notes_text else None,
         )
 
         rest = step.rest_after
@@ -457,6 +530,7 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._render_current()
 
     def _on_rest_finished(self, _timer: CountdownTimer) -> None:
+        sound.play("complete")
         self._render_current()
 
     def _on_skip_rest_clicked(self, _btn: Gtk.Button) -> None:
@@ -464,7 +538,26 @@ class WorkoutRunPage(Adw.NavigationPage):
         self._render_current()
 
     def _on_finish_clicked(self, _btn: Gtk.Button) -> None:
-        self._end_session()
+        self._hold_timer.pause()
+        self._rest_timer.pause()
+        dialog = Adw.AlertDialog()
+        dialog.set_heading("Finish Workout?")
+        dialog.set_body("Any remaining sets will not be logged. This cannot be undone.")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("finish", "Finish")
+        dialog.set_response_appearance("finish", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response("cancel")
+        dialog.set_close_response("cancel")
+
+        def on_response(_d: Adw.AlertDialog, r: str) -> None:
+            if r == "finish":
+                self._end_session()
+            else:
+                self._hold_timer.resume()
+                self._rest_timer.resume()
+
+        dialog.connect("response", on_response)
+        present_dialog(dialog, self)
 
     def _on_done_clicked(self, _btn: Gtk.Button) -> None:
         self.emit("finished")

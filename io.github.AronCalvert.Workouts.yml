@@ -9,6 +9,10 @@ finish-args:
   - --socket=fallback-x11
   - --socket=wayland
   - --device=dri
+  - --socket=pulseaudio
+  - --filesystem=xdg-run/dconf
+  - --filesystem=~/.config/dconf:ro
+  - --env=DCONF_USER_CONFIG_DIR=.config/dconf
 
 modules:
   - name: workouts

@@ -25,21 +25,19 @@ class MainWindow(Adw.ApplicationWindow):
         self._main_page = MainPage(app)
         self._main_page.connect("workout-activated", self._on_workout_activated)
         self._nav.push(self._main_page)
+        self._nav.connect("popped", self._on_nav_popped)
 
     @property
     def db(self):
         return self.get_application().db
 
     def _on_workout_activated(self, _page: MainPage, workout_id: int) -> None:
-        if self.db.get_workout_plan(workout_id) is None:
-            return
-
         detail = WorkoutDetailPage(self.get_application(), workout_id)
         detail.connect("begin-workout", self._on_begin_workout)
         self._nav.push(detail)
 
-    def _on_begin_workout(self, _page: WorkoutDetailPage, workout_id: int) -> None:
-        plan = self.db.get_workout_plan(workout_id)
+    def _on_begin_workout(self, page: WorkoutDetailPage, workout_id: int) -> None:
+        plan = page.plan or self.db.get_workout_plan(workout_id)
         if plan is None:
             return
         session_id = self.db.start_session(workout_id)
@@ -52,6 +50,9 @@ class MainWindow(Adw.ApplicationWindow):
         run.connect("finished", self._on_run_finished)
         self._nav.push(run)
 
+    def _on_nav_popped(self, _nav: Adw.NavigationView, page) -> None:
+        if isinstance(page, WorkoutDetailPage):
+            self._main_page.refresh()
+
     def _on_run_finished(self, _page: WorkoutRunPage) -> None:
         self._nav.pop_to_page(self._main_page)
-        self._main_page.refresh()

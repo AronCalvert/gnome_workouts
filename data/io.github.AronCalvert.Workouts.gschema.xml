@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="io.github.AronCalvert.Workouts" path="/io/github/AronCalvert/Workouts/">
+    <key name="weight-unit" type="s">
+      <default>'kg'</default>
+      <summary>Weight unit for display</summary>
+      <description>The unit used to display and enter weights. Either 'kg' or 'lbs'.</description>
+    </key>
+  </schema>
+</schemalist>

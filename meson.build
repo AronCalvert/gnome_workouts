@@ -4,7 +4,6 @@ project('workouts',
   license: 'GPL-3.0-or-later',
 )
 
-i18n = import('i18n')
 gnome = import('gnome')
 python = import('python').find_installation('python3')
 
@@ -15,12 +14,12 @@ conf.set('PYTHON', python.full_path())
 conf.set('VERSION', meson.project_version())
 conf.set('pkgdatadir', pkgdatadir)
 
-subdir('po')
 subdir('data')
 subdir('bin')
-subdir('workouts')
+subdir('src')
 
 gnome.post_install(
   gtk_update_icon_cache: true,
   update_desktop_database: true,
+  glib_compile_schemas: true,
 )

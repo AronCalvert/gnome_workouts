@@ -5,10 +5,17 @@ import gi
 gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Adw, Gio, GObject, Gtk
+from gi.repository import Adw, GLib, Gio, GObject, Gtk
 
 from .progress_page import HistoryPage
-from ..ui_utils import *
+from ..ui_utils import (
+    clear_container,
+    create_boxed_listbox,
+    create_header_button,
+    present_dialog,
+    set_margins,
+    style_header_icon_button,
+)
 
 
 class MainPage(Adw.NavigationPage):
@@ -50,13 +57,33 @@ class MainPage(Adw.NavigationPage):
         add_btn.connect("clicked", self._on_add_workout_clicked)
         header.pack_start(add_btn)
 
-        prefs_btn = create_header_button(
-            "open-menu-symbolic",
-            tooltip="Preferences",
-            accessible_name="Preferences",
+        unit_section = Gio.Menu()
+        unit_section.append("Kilograms (kg)", "mainpage.weight-unit::kg")
+        unit_section.append("Pounds (lbs)", "mainpage.weight-unit::lbs")
+
+        app_menu = Gio.Menu()
+        app_menu.append_section("Weight Unit", unit_section)
+        app_menu.append("About Workouts", "mainpage.about")
+
+        menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=app_menu)
+        menu_btn.set_tooltip_text("Main menu")
+        menu_btn.add_css_class("flat")
+        header.pack_end(menu_btn)
+
+        current_unit = self._app.prefs.weight_unit
+        weight_unit_action = Gio.SimpleAction.new_stateful(
+            "weight-unit",
+            GLib.VariantType.new("s"),
+            GLib.Variant.new_string(current_unit),
         )
-        prefs_btn.connect("clicked", self._on_prefs_clicked)
-        header.pack_end(prefs_btn)
+        weight_unit_action.connect("activate", self._on_weight_unit_changed)
+
+        page_actions = Gio.SimpleActionGroup()
+        page_actions.add_action(weight_unit_action)
+        about_action = Gio.SimpleAction.new("about", None)
+        about_action.connect("activate", lambda *_: self._show_about())
+        page_actions.add_action(about_action)
+        self.insert_action_group("mainpage", page_actions)
 
         self._toast_overlay = Adw.ToastOverlay()
         self._toast_overlay.set_child(self._stack)
@@ -102,8 +129,7 @@ class MainPage(Adw.NavigationPage):
         return clamp
 
     def refresh(self) -> None:
-        if hasattr(self, "_history_page"):
-            self._history_page.refresh()
+        self._history_page.refresh()
 
         clear_container(self._list)
 
@@ -258,39 +284,22 @@ class MainPage(Adw.NavigationPage):
         dialog.connect("response", on_response)
         present_dialog(dialog, self)
 
-    def _on_prefs_clicked(self, _btn: Gtk.Button) -> None:
-        prefs = self._app.prefs
+    def _on_weight_unit_changed(
+        self, action: Gio.SimpleAction, value: GLib.Variant
+    ) -> None:
+        action.set_state(value)
+        self._app.prefs.weight_unit = value.get_string()
 
-        dialog = Adw.AlertDialog()
-        dialog.set_heading("Preferences")
-
-        unit_model = Gtk.StringList()
-        unit_model.append("Kilograms (kg)")
-        unit_model.append("Pounds (lbs)")
-        unit_dd = Gtk.DropDown(model=unit_model)
-        unit_dd.set_selected(0 if prefs.weight_unit == "kg" else 1)
-        unit_dd.set_hexpand(True)
-        unit_dd.set_valign(Gtk.Align.CENTER)
-        set_accessible_label(unit_dd, "Weight unit")
-        unit_row = Adw.ActionRow(title="Weight Unit")
-        unit_row.add_suffix(unit_dd)
-
-        form = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        form.append(unit_row)
-        dialog.set_extra_child(form)
-
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("save", "Save")
-        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
-        dialog.set_default_response("save")
-        dialog.set_close_response("cancel")
-
-        def on_response(_d: Adw.AlertDialog, response: str) -> None:
-            if response != "save":
-                return
-            prefs.weight_unit = "kg" if unit_dd.get_selected() == 0 else "lbs"
-
-        dialog.connect("response", on_response)
+    def _show_about(self) -> None:
+        dialog = Adw.AboutDialog(
+            application_name="Workouts",
+            application_icon="io.github.AronCalvert.Workouts",
+            developer_name="Aron Calvert",
+            version="0.1.0",
+            website="https://github.com/AronCalvert/gnome-workouts",
+            issue_url="https://github.com/AronCalvert/gnome-workouts/issues",
+            license_type=Gtk.License.GPL_3_0,
+        )
         present_dialog(dialog, self)
 
     def _on_add_workout_clicked(self, _btn: Gtk.Button) -> None:

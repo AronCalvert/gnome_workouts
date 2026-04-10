@@ -10,7 +10,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Adw, Gio
 
 from .db import open_default_db
-from .prefs import Preferences, default_prefs_path
+from .prefs import Preferences
 from .window import MainWindow
 
 
@@ -28,7 +28,7 @@ class WorkoutApp(Adw.Application):
     @property
     def prefs(self) -> Preferences:
         if self._prefs is None:
-            self._prefs = Preferences(default_prefs_path(APP_ID))
+            self._prefs = Preferences()
         return self._prefs
 
     @property

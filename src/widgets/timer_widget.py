@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import time
+from time import monotonic
 
 import gi
 
@@ -8,6 +8,8 @@ gi.require_version("Adw", "1")
 gi.require_version("Gtk", "4.0")
 
 from gi.repository import GLib, GObject, Gtk
+
+from .. import sound
 
 
 def _format_mmss(seconds: int) -> str:
@@ -25,7 +27,7 @@ class CountdownTimer(Gtk.Box):
         "finished": (GObject.SignalFlags.RUN_FIRST, None, ()),
     }
 
-    def __init__(self, *, pill: bool = False, show_reset: bool = True) -> None:
+    def __init__(self, *, pill: bool = False, show_reset: bool = True, play_ticks: bool = False) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=8)
 
         self._duration = 0
@@ -34,6 +36,8 @@ class CountdownTimer(Gtk.Box):
         self._t_start = 0.0
         self._elapsed_before = 0.0
         self._tick_source: int | None = None
+        self._play_ticks = play_ticks
+        self._last_tick_second = -1
 
         self._time = Gtk.Label(label="0:00")
         self._time.add_css_class("title-1")
@@ -47,7 +51,7 @@ class CountdownTimer(Gtk.Box):
         self._primary.add_css_class("suggested-action")
         if pill:
             self._primary.add_css_class("pill")
-        self._primary.set_tooltip_text("Start, pause, or resume the rest countdown")
+        self._primary.set_tooltip_text("Start, pause, or resume the countdown")
         self._primary.connect("clicked", self._on_primary_clicked)
 
         self._reset = Gtk.Button(label="Reset")
@@ -79,7 +83,7 @@ class CountdownTimer(Gtk.Box):
     def remaining_seconds(self) -> int:
         elapsed = self._elapsed_before
         if self._running and not self._paused:
-            elapsed += max(0.0, time.monotonic() - self._t_start)
+            elapsed += max(0.0, monotonic() - self._t_start)
         return max(0, int(round(self._duration - elapsed)))
 
     def start(self) -> None:
@@ -89,14 +93,15 @@ class CountdownTimer(Gtk.Box):
         self._running = True
         self._paused = False
         self._elapsed_before = 0.0
-        self._t_start = time.monotonic()
+        self._t_start = monotonic()
+        self._last_tick_second = -1
         self._ensure_tick()
         self._update_ui()
 
     def pause(self) -> None:
         if not self._running or self._paused:
             return
-        self._elapsed_before += max(0.0, time.monotonic() - self._t_start)
+        self._elapsed_before += max(0.0, monotonic() - self._t_start)
         self._paused = True
         self._update_ui()
 
@@ -104,7 +109,7 @@ class CountdownTimer(Gtk.Box):
         if not self._running or not self._paused:
             return
         self._paused = False
-        self._t_start = time.monotonic()
+        self._t_start = monotonic()
         self._ensure_tick()
         self._update_ui()
 
@@ -113,6 +118,7 @@ class CountdownTimer(Gtk.Box):
         self._paused = False
         self._elapsed_before = 0.0
         self._t_start = 0.0
+        self._last_tick_second = -1
         self._stop_tick()
         self._update_ui()
 
@@ -133,7 +139,11 @@ class CountdownTimer(Gtk.Box):
             return False
         if self._paused:
             return True
-        if self.remaining_seconds() <= 0:
+        remaining = self.remaining_seconds()
+        if self._play_ticks and 0 < remaining <= 5 and remaining != self._last_tick_second:
+            self._last_tick_second = remaining
+            sound.play("bell")
+        if remaining <= 0:
             self._running = False
             self._paused = False
             self._update_ui()
